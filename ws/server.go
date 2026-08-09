@@ -343,9 +343,27 @@ func (s *server) stopConnections() {
 }
 
 func (s *server) Write(webSocketId string, data []byte) error {
+	// OLD:
+	// s.connMutex.RLock()
+	// defer s.connMutex.RUnlock()
+	// w, ok := s.connections[webSocketId]
+	// if !ok {
+	// 	return fmt.Errorf("couldn't write to websocket. No socket with id %v is open", webSocketId)
+	// }
+	// log.Debugf("queuing data for websocket %s", webSocketId)
+	// return w.Write(data)
+
+	// EVC OCPP PATCH: hold the lock for the map lookup only.
+	// Holding it across w.Write meant one socket that had stopped draining parked a reader
+	// here indefinitely; the next writer queued behind it and, RWMutex being
+	// writer-preferring, every later reader queued behind that. The result was a server that
+	// accepted TCP connections and answered health checks while being unable to write a
+	// single byte to any charge point. w.Write is safe outside this lock — the *webSocket
+	// carries its own.
 	s.connMutex.RLock()
-	defer s.connMutex.RUnlock()
 	w, ok := s.connections[webSocketId]
+	s.connMutex.RUnlock()
+
 	if !ok {
 		return fmt.Errorf("couldn't write to websocket. No socket with id %v is open", webSocketId)
 	}
@@ -481,11 +499,26 @@ func (s *server) handleMessage(w Channel, data []byte) error {
 }
 
 func (s *server) handleDisconnect(w Channel, _ error) {
-	// server never attempts to auto-reconnect to client. Resources are simply freed up
+	// server never attempts to auto-reconnect to client. Resources are simply freed up.
+	// OLD:
+	// s.connMutex.Lock()
+	// delete(s.connections, w.ID())
+	// s.connMutex.Unlock()
+
+	// EVC OCPP PATCH: delete by identity, not by id.
+	// When a charge point reconnects, wsHandler replaces the map entry with the new socket
+	// while the old one is still tearing down on its own goroutine; a blind delete by id then
+	// removes the live replacement, leaving a charger that is connected but unreachable
+	// ("No socket with id X is open" on every write) until it gives up and reconnects — which
+	// starts the same race again.
 	s.connMutex.Lock()
-	delete(s.connections, w.ID())
+	if existing, ok := s.connections[w.ID()]; ok && Channel(existing) == w {
+		delete(s.connections, w.ID())
+	}
 	s.connMutex.Unlock()
 	log.Infof("closed connection to %s", w.ID())
+	// The callback still fires either way: this socket really did disconnect, and it is up to
+	// the handler to recognise a stale one.
 	if s.disconnectedHandler != nil {
 		s.disconnectedHandler(w)
 	}

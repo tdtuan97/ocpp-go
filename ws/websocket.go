@@ -240,6 +240,14 @@ type webSocket struct {
 	onMessage          MessageHandler
 }
 
+// EVC OCPP PATCH: per-connection outbound buffer, was hardcoded to 2 in newWebSocket.
+// A charger that is merely slow fills two slots between writes, and a full queue used to
+// block the writer while it held both this socket's lock and the server's connection-map
+// lock — taking every other connection down with it. Sized so only a socket that has
+// genuinely stopped draining reaches the limit, where WriteManual now reports an error
+// instead of waiting.
+const outQueueSize = 64
+
 func newWebSocket(id string, conn *websocket.Conn, tlsState *tls.ConnectionState, cfg WebSocketConfig, onMessage MessageHandler, onClosed DisconnectedHandler, onError ErrorHandler) *webSocket {
 	if conn == nil {
 		panic("cannot create websocket with nil connection")
@@ -249,13 +257,16 @@ func newWebSocket(id string, conn *websocket.Conn, tlsState *tls.ConnectionState
 		connection:         conn,
 		mutex:              sync.RWMutex{},
 		tlsConnectionState: tlsState,
-		outQueue:           make(chan message, 2),
-		pingC:              make(chan []byte, 1),
-		closeC:             make(chan websocket.CloseError, 1),
-		forceCloseC:        make(chan error, 1),
-		onClosed:           onClosed,
-		onError:            onError,
-		onMessage:          onMessage,
+		// OLD:
+		// outQueue:        make(chan message, 2),
+		// EVC OCPP PATCH: see outQueueSize.
+		outQueue:    make(chan message, outQueueSize),
+		pingC:       make(chan []byte, 1),
+		closeC:      make(chan websocket.CloseError, 1),
+		forceCloseC: make(chan error, 1),
+		onClosed:    onClosed,
+		onError:     onError,
+		onMessage:   onMessage,
 	}
 	w.updateConfig(cfg)
 	return w
@@ -296,8 +307,25 @@ func (w *webSocket) WriteManual(messageTyp int, data []byte) error {
 	if w.connection == nil {
 		return fmt.Errorf("cannot write to closed connection %s", w.id)
 	}
-	w.outQueue <- msg
-	return nil
+	// OLD:
+	// w.outQueue <- msg
+	// return nil
+
+	// EVC OCPP PATCH: never block here.
+	// This runs with w.mutex held as a reader, and the caller (server.Write) holds the
+	// server's connection-map lock as a reader too. A blocking send strands both: writePump
+	// can only drain this queue by exiting into cleanup, and cleanup needs w.mutex as a
+	// writer, which this reader is holding. That is a hard deadlock, and because Go's RWMutex
+	// is writer-preferring the stranded connection-map reader then starves every later reader
+	// — no charge point can connect, no response can be written, and nothing returns an error
+	// to log. Dropping one message for one unresponsive socket is a far smaller loss, and the
+	// caller gets a real error it can act on.
+	select {
+	case w.outQueue <- msg:
+		return nil
+	default:
+		return fmt.Errorf("send queue full for connection %s, dropping message", w.id)
+	}
 }
 
 func (w *webSocket) Close(closeError websocket.CloseError) error {
@@ -306,8 +334,20 @@ func (w *webSocket) Close(closeError websocket.CloseError) error {
 	if w.connection == nil {
 		return fmt.Errorf("cannot close already closed connection %s", w.id)
 	}
-	w.closeC <- closeError
-	return nil
+	// OLD:
+	// w.closeC <- closeError
+	// return nil
+
+	// EVC OCPP PATCH: non-blocking, for the same reason as WriteManual and because closeC holds a
+	// single slot — a second close request for the same socket parked here forever holding
+	// w.mutex as a reader, which prevented cleanup from ever running. One pending close is
+	// all that is meaningful anyway: the socket cannot close twice.
+	select {
+	case w.closeC <- closeError:
+		return nil
+	default:
+		return nil
+	}
 }
 
 func (w *webSocket) updateConfig(cfg WebSocketConfig) {
@@ -355,17 +395,49 @@ func (w *webSocket) initPingPong() {
 }
 
 func (w *webSocket) onPing(appData string) error {
+	// OLD:
+	// conn := w.connection
+	// w.log.Debugf("ping received from %s: %s", w.id, appData)
+	// // Schedule pong message via dedicated channel
+	// w.pingC <- []byte(appData)
+	// w.log.Debugf("pong scheduled for %s", w.id)
+
+	// EVC OCPP PATCH: hold the read lock for the whole handler, which every other channel sender on
+	// this type already did. cleanup closes pingC under the write lock, so the unguarded send
+	// could land on a closed channel and panic the entire process; reading w.connection
+	// without the lock also races with cleanup nilling it.
+	w.mutex.RLock()
+	defer w.mutex.RUnlock()
 	conn := w.connection
+	if conn == nil {
+		return nil
+	}
 	w.log.Debugf("ping received from %s: %s", w.id, appData)
-	// Schedule pong message via dedicated channel
-	w.pingC <- []byte(appData)
-	w.log.Debugf("pong scheduled for %s", w.id)
+	// Schedule pong message via dedicated channel. Non-blocking: a pong that cannot be queued
+	// because writePump has stopped draining is worthless, and waiting for it would park the
+	// read loop of a socket that is already dead.
+	select {
+	case w.pingC <- []byte(appData):
+		w.log.Debugf("pong scheduled for %s", w.id)
+	default:
+		w.log.Debugf("pong dropped for %s, writer is not draining", w.id)
+	}
 	// Reset read interval after receiving a ping
 	return conn.SetReadDeadline(w.getReadTimeout())
 }
 
 func (w *webSocket) onPong(appData string) error {
+	// OLD:
+	// conn := w.connection
+
+	// EVC OCPP PATCH: same guard as onPing — cleanup nils w.connection under the write lock, so
+	// reading it without the lock is a data race with a nil dereference at the end of it.
+	w.mutex.RLock()
+	defer w.mutex.RUnlock()
 	conn := w.connection
+	if conn == nil {
+		return nil
+	}
 	w.log.Debugf("pong received from %s: %s", w.id, appData)
 	// Reset read interval after receiving a pong
 	return conn.SetReadDeadline(w.getReadTimeout())
@@ -419,9 +491,18 @@ func (w *webSocket) readPump() {
 				w.mutex.RUnlock()
 				return
 			}
-			// Notify writePump of error. Force close will be handled there
+			// Notify writePump of error. Force close will be handled there.
+			// OLD:
+			// w.forceCloseC <- err
+
+			// EVC OCPP PATCH: non-blocking. forceCloseC holds one slot, and if writePump has
+			// already stopped draining, parking here holds w.mutex as a reader forever and
+			// blocks the cleanup that is the only thing able to finish this teardown.
 			w.log.Debugf("handling read error for %s: %v", w.id, err.Error())
-			w.forceCloseC <- err
+			select {
+			case w.forceCloseC <- err:
+			default:
+			}
 			w.mutex.RUnlock()
 			return
 		}

@@ -373,6 +373,13 @@ type DefaultServerDispatcher struct {
 	onRequestCancel     CanceledRequestHandler
 	network             ws.Server
 	mutex               sync.RWMutex
+	// EVC OCPP PATCH: dedicated mutex for pendingRequestState (was d.mutex itself).
+	// Sharing d.mutex put every inbound message on the same lock as the dispatch machinery:
+	// serverState takes a *write* lock even for reads, and Server.ocppMessageHandler calls
+	// GetClientState for every frame from every charge point. One goroutine parked while
+	// holding d.mutex as a reader was therefore enough to stop the server reading from any
+	// connection at all.
+	stateMutex sync.RWMutex
 }
 
 // Handler function to be invoked when a request gets canceled (either due to timeout or to other external factors).
@@ -391,20 +398,49 @@ func (c clientTimeoutContext) isActive() bool {
 // NewDefaultServerDispatcher creates a new DefaultServerDispatcher struct.
 func NewDefaultServerDispatcher(queueMap ServerQueueMap) *DefaultServerDispatcher {
 	d := &DefaultServerDispatcher{
-		queueMap:         queueMap,
-		requestChannel:   nil,
-		readyForDispatch: make(chan string, 1),
+		queueMap:       queueMap,
+		requestChannel: nil,
+		// OLD:
+		// readyForDispatch: make(chan string, 1),
+		// EVC OCPP PATCH: see readyForDispatchSize.
+		readyForDispatch: make(chan string, readyForDispatchSize),
 		timeout:          defaultMessageTimeout,
 	}
-	d.pendingRequestState = NewServerState(&d.mutex)
+	// OLD:
+	// d.pendingRequestState = NewServerState(&d.mutex)
+	// EVC OCPP PATCH: see stateMutex on the struct.
+	d.pendingRequestState = NewServerState(&d.stateMutex)
 	return d
 }
+
+// EVC OCPP PATCH: channel sizes for the single messagePump goroutine.
+// Previously readyForDispatch=1, requestChannel=20, timerC=10 — small enough that a busy
+// server filled them routinely, and every producer sent blocking while holding d.mutex as a
+// reader, so a full channel did not just delay one request: it froze the dispatcher and,
+// through the shared lock, the read path of every connection.
+//
+// readyForDispatch is the important one. CompleteRequest sends on it, and messagePump calls
+// CompleteRequest itself when a request times out or a write fails. At capacity 1 the pump
+// could block on a channel only it drains — deadlocking against itself.
+const (
+	requestChannelSize   = 256
+	readyForDispatchSize = 256
+	timerChannelSize     = 256
+	// dispatchSignalTimeout caps how long a caller waits to hand work to the pump. Reaching it
+	// means the pump is stalled, and an error the caller can report beats a goroutine that
+	// never returns.
+	dispatchSignalTimeout = 5 * time.Second
+)
 
 func (d *DefaultServerDispatcher) Start() {
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
-	d.requestChannel = make(chan string, 20)
-	d.timerC = make(chan string, 10)
+	// OLD:
+	// d.requestChannel = make(chan string, 20)
+	// d.timerC = make(chan string, 10)
+	// EVC OCPP PATCH: see the channel-size block above.
+	d.requestChannel = make(chan string, requestChannelSize)
+	d.timerC = make(chan string, timerChannelSize)
 	d.stoppedC = make(chan struct{}, 1)
 	d.running = true
 	go d.messagePump()
@@ -436,10 +472,33 @@ func (d *DefaultServerDispatcher) CreateClient(clientID string) {
 func (d *DefaultServerDispatcher) DeleteClient(clientID string) {
 	d.queueMap.Remove(clientID)
 	if d.IsRunning() {
-		d.mutex.RLock()
-		d.requestChannel <- clientID
-		d.mutex.RUnlock()
+		// OLD:
+		// d.mutex.RLock()
+		// d.requestChannel <- clientID
+		// d.mutex.RUnlock()
+
+		// EVC OCPP PATCH: non-blocking, with the lock released before the send.
+		// This runs on the disconnecting socket's own goroutine, inside the teardown path:
+		// parking here left that teardown unfinished forever while holding d.mutex as a
+		// reader. The queue is already removed above, so a dropped wake-up costs nothing —
+		// the pump has nothing left to dispatch for this client.
+		if ch := d.signalChannel(); ch != nil {
+			select {
+			case ch <- clientID:
+			default:
+			}
+		}
 	}
+}
+
+// EVC OCPP PATCH: signalChannel returns the pump's wake-up channel under the lock, so
+// callers can send on it after releasing. Sending while holding d.mutex is what let a full
+// channel escalate from a stalled dispatcher into a server that could no longer read from
+// any connection.
+func (d *DefaultServerDispatcher) signalChannel() chan string {
+	d.mutex.RLock()
+	defer d.mutex.RUnlock()
+	return d.requestChannel
 }
 
 func (d *DefaultServerDispatcher) SetNetworkServer(server ws.Server) {
@@ -465,10 +524,27 @@ func (d *DefaultServerDispatcher) SendRequest(clientID string, req RequestBundle
 	if err := q.Push(req); err != nil {
 		return err
 	}
-	d.mutex.RLock()
-	d.requestChannel <- clientID
-	d.mutex.RUnlock()
-	return nil
+	// OLD:
+	// d.mutex.RLock()
+	// d.requestChannel <- clientID
+	// d.mutex.RUnlock()
+	// return nil
+
+	// EVC OCPP PATCH: bounded wait, off the lock.
+	// Unlike DeleteClient a lost wake-up matters here — the request is already queued — so
+	// this waits rather than dropping it. But it must not wait forever: callers reach this
+	// through a process-wide callback lock, so one caller parked here stopped every charge
+	// point's requests and responses, not just this one's.
+	ch := d.signalChannel()
+	if ch == nil {
+		return fmt.Errorf("cannot send request %s, dispatcher is not running", req.Call.UniqueId)
+	}
+	select {
+	case ch <- clientID:
+		return nil
+	case <-time.After(dispatchSignalTimeout):
+		return fmt.Errorf("cannot send request %s, dispatcher is not accepting work for %s", req.Call.UniqueId, clientID)
+	}
 }
 
 // requestPump processes new outgoing requests for each client and makes sure they are processed sequentially.
@@ -621,11 +697,22 @@ func (d *DefaultServerDispatcher) waitForTimeout(clientID string, clientCtx clie
 	case <-clientCtx.ctx.Done():
 		err := clientCtx.ctx.Err()
 		if err == context.DeadlineExceeded {
-			// Timeout triggered, notifying messagePump
+			// Timeout triggered, notifying messagePump.
+			// OLD:
+			// d.timerC <- clientID
+
+			// EVC OCPP PATCH: non-blocking. One of these goroutines exists per dispatched
+			// request, so a stalled pump parked them all — each holding d.mutex as a reader —
+			// within one timeout period of the first stall. That is what turned a single stuck
+			// request into a server-wide freeze.
 			d.mutex.RLock()
 			defer d.mutex.RUnlock()
 			if d.running {
-				d.timerC <- clientID
+				select {
+				case d.timerC <- clientID:
+				default:
+					log.Errorf("timeout notification dropped for %s, message pump is not draining", clientID)
+				}
 			}
 		} else {
 			log.Debugf("timeout canceled for %s", clientID)
@@ -655,6 +742,19 @@ func (d *DefaultServerDispatcher) CompleteRequest(clientID string, requestID str
 	q.Pop()
 	d.pendingRequestState.DeletePendingRequest(clientID, requestID)
 	log.Debugf("completed request %s for %s", callID, clientID)
-	// Signal that next message in queue may be sent
-	d.readyForDispatch <- clientID
+	// Signal that next message in queue may be sent.
+	// OLD:
+	// d.readyForDispatch <- clientID
+
+	// EVC OCPP PATCH: non-blocking — this is the one that mattered most.
+	// messagePump is the only reader of readyForDispatch, yet it calls CompleteRequest itself,
+	// on a request timeout and on a failed write. With the old capacity of 1, a concurrent
+	// CompleteRequest from an inbound CallResult could occupy the slot and leave the pump
+	// blocked on a channel nobody else drains: a deadlock against itself, from which the whole
+	// server never recovered.
+	select {
+	case d.readyForDispatch <- clientID:
+	default:
+		log.Errorf("dispatch signal dropped for %s, message pump is not draining", clientID)
+	}
 }
