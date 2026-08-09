@@ -24,7 +24,7 @@ func newStuckSocket(t *testing.T, id string) *webSocket {
 		// Non-nil so WriteManual gets past its closed-connection check. Nothing in these tests
 		// touches the wire: WriteManual only queues.
 		connection:  &websocket.Conn{},
-		outQueue:    make(chan message, outQueueSize),
+		outQueue:    make(chan message, 2), // same capacity newWebSocket uses
 		pingC:       make(chan []byte, 1),
 		closeC:      make(chan websocket.CloseError, 1),
 		forceCloseC: make(chan error, 1),
@@ -159,27 +159,49 @@ func TestHandleDisconnect_RemovesItsOwnSocket(t *testing.T) {
 // onPing sends on a channel that cleanup closes under the write lock. Without holding the
 // read lock the send could land on a closed channel, which panics — taking down every
 // charger on the pod, not just this one.
+//
+// This one needs a genuine connection: onPing ends in conn.SetReadDeadline, which a
+// hand-built websocket.Conn cannot serve. The socket therefore comes from a real handshake,
+// and the teardown is the real cleanup rather than an imitation of it.
 func TestOnPing_SafeAgainstConcurrentCleanup(t *testing.T) {
-	w := newStuckSocket(t, "stuck")
+	const port = 18993
 
+	s := NewServer().(*server)
+	s.AddSupportedSubprotocol(defaultSubProtocol)
+	s.SetMessageHandler(func(Channel, []byte) error { return nil })
+	connected := make(chan string, 2)
+	s.SetNewClientHandler(func(c Channel) { connected <- c.ID() })
+
+	go s.Start(port, serverPath)
+	defer s.Stop()
+
+	client := dialClientAt(t, port, "CP-PING")
+	defer client.Close()
+	select {
+	case <-connected:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server never registered the client")
+	}
+
+	s.connMutex.RLock()
+	w := s.connections["CP-PING"]
+	s.connMutex.RUnlock()
+	require.NotNil(t, w)
+
+	// Drive the teardown the way it actually happens — the peer goes away and writePump runs
+	// cleanup once — rather than calling cleanup directly, which no production path does and
+	// which would enter it a second time behind writePump's back.
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for i := 0; i < 200; i++ {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
 			_ = w.onPing("data")
 		}
 	}()
-	go func() {
-		defer wg.Done()
-		// Stand in for cleanup: closes the channels under the write lock.
-		w.mutex.Lock()
-		w.connection = nil
-		close(w.outQueue)
-		close(w.pingC)
-		close(w.closeC)
-		close(w.forceCloseC)
-		w.mutex.Unlock()
-	}()
+
+	time.Sleep(100 * time.Millisecond)
+	_ = client.Close()
 	wg.Wait()
 }
