@@ -291,3 +291,48 @@ func TestHandleDisconnect_SupersededSocketFiresCallbackOnce(t *testing.T) {
 	require.True(t, ok, "replacement socket must still be registered")
 	assert.Same(t, chB, live, "connection map must still hold the replacement")
 }
+
+// RemoteAddr used to read w.connection, which cleanup() sets to nil. A caller holding a
+// Channel for a socket that had just closed (the connect callback is the usual one: the
+// peer can vanish between the upgrade and the callback) dereferenced nil.
+func TestRemoteAddr_SafeAfterCleanup(t *testing.T) {
+	const port = 18995
+
+	s := NewServer().(*server)
+	s.AddSupportedSubprotocol(defaultSubProtocol)
+	s.SetMessageHandler(func(Channel, []byte) error { return nil })
+	connected := make(chan Channel, 1)
+	s.SetNewClientHandler(func(c Channel) { connected <- c })
+
+	go s.Start(port, serverPath)
+	defer s.Stop()
+
+	client := dialClientAt(t, port, "CP-ADDR")
+	var ch Channel
+	select {
+	case ch = <-connected:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server never registered the client")
+	}
+	want := ch.RemoteAddr().String()
+
+	_ = client.Close()
+	w := ch.(*webSocket)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		w.mutex.RLock()
+		torndown := w.connection == nil
+		w.mutex.RUnlock()
+		if torndown {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("socket never finished cleanup")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	require.NotPanics(t, func() { _ = ch.RemoteAddr() })
+	require.NotNil(t, ch.RemoteAddr())
+	assert.Equal(t, want, ch.RemoteAddr().String(), "the peer address must outlive the connection")
+}

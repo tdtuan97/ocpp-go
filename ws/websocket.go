@@ -228,6 +228,7 @@ type webSocket struct {
 	connection         *websocket.Conn
 	mutex              sync.RWMutex
 	id                 string
+	remoteAddr         net.Addr // EVC OCPP PATCH: fixed for the socket's lifetime, see RemoteAddr
 	outQueue           chan message
 	pingC              chan []byte
 	closeC             chan websocket.CloseError // used to gracefully close a websocket connection.
@@ -259,6 +260,7 @@ func newWebSocket(id string, conn *websocket.Conn, tlsState *tls.ConnectionState
 	w := &webSocket{
 		id:                 id,
 		connection:         conn,
+		remoteAddr:         conn.RemoteAddr(),
 		mutex:              sync.RWMutex{},
 		tlsConnectionState: tlsState,
 		outQueue:           make(chan message, 2),
@@ -280,7 +282,13 @@ func (w *webSocket) ID() string {
 
 // Returns the address of the remote peer.
 func (w *webSocket) RemoteAddr() net.Addr {
-	return w.connection.RemoteAddr()
+	// OLD:
+	// return w.connection.RemoteAddr()
+
+	// EVC OCPP PATCH: answer from the address captured at construction. cleanup() nils
+	// w.connection, so the old read panicked for any caller still holding the Channel of
+	// a socket that had just closed, and raced cleanup even when it did not.
+	return w.remoteAddr
 }
 
 // Returns the TLS connection state of the connection, if any.
