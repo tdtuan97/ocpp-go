@@ -360,6 +360,18 @@ func (w *webSocket) Close(closeError websocket.CloseError) error {
 	}
 }
 
+// EVC OCPP PATCH: hard-close the underlying connection under the read lock, for callers
+// that need the socket gone now rather than Close()'s graceful handshake. cleanup() nils
+// w.connection under the write lock, so reading that field unsynchronized can nil-deref.
+func (w *webSocket) closeUnderlying() {
+	w.mutex.RLock()
+	defer w.mutex.RUnlock()
+	if w.connection == nil {
+		return
+	}
+	_ = w.connection.Close()
+}
+
 func (w *webSocket) updateConfig(cfg WebSocketConfig) {
 	w.mutex.Lock()
 	defer w.mutex.Unlock()

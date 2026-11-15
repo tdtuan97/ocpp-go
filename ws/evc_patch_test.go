@@ -205,3 +205,89 @@ func TestOnPing_SafeAgainstConcurrentCleanup(t *testing.T) {
 	_ = client.Close()
 	wg.Wait()
 }
+
+// A charge point on a flaky link redials the same pod before its old socket has finished
+// tearing down. wsHandler replaces the map entry and invokes the disconnect callback inline
+// for the old socket; that old socket's own writePump then reaches handleDisconnect a moment
+// later, and before the identity gate it fired the callback a SECOND time.
+//
+// That second call is the damaging one. Everything downstream of disconnectedHandler is keyed
+// by ID() alone (ocppj DeleteClient / ClearClientPendingRequest, and the 1.6 callbackQueue
+// drain), so it tore down the dispatcher state of the replacement socket that now owns the ID.
+// The charger stayed in the connection map reporting healthy, while every command to it failed
+// with "no client %s exists" until it reconnected again.
+//
+// The old socket's writePump can sit in conn.WriteMessage for up to WriteWait against a
+// half-open peer, so this interleaving is the expected one for a flaky link, not a rare race.
+func TestHandleDisconnect_SupersededSocketFiresCallbackOnce(t *testing.T) {
+	const port = 18994
+	const cpID = "CP-DUP"
+
+	s := NewServer().(*server)
+	s.AddSupportedSubprotocol(defaultSubProtocol)
+	s.SetMessageHandler(func(Channel, []byte) error { return nil })
+
+	connected := make(chan Channel, 2)
+	s.SetNewClientHandler(func(c Channel) { connected <- c })
+
+	var mu sync.Mutex
+	calls := map[Channel]int{}
+	s.SetDisconnectedClientHandler(func(c Channel) {
+		mu.Lock()
+		calls[c]++
+		mu.Unlock()
+	})
+
+	go s.Start(port, serverPath)
+	defer s.Stop()
+
+	clientA := dialClientAt(t, port, cpID)
+	defer clientA.Close()
+	var chA Channel
+	select {
+	case chA = <-connected:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server never registered the first client")
+	}
+
+	// Same ID, so wsHandler takes the replace branch while the first socket is still live.
+	clientB := dialClientAt(t, port, cpID)
+	defer clientB.Close()
+	var chB Channel
+	select {
+	case chB = <-connected:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server never registered the replacement client")
+	}
+	require.NotSame(t, chA, chB, "replacement must be a distinct socket")
+
+	// Wait for the superseded socket to finish its own teardown: cleanup() nils the
+	// connection under the write lock, and handleDisconnect runs immediately after.
+	wA := chA.(*webSocket)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		wA.mutex.RLock()
+		torndown := wA.connection == nil
+		wA.mutex.RUnlock()
+		if torndown {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("superseded socket never finished cleanup")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// handleDisconnect runs just past the nil assignment; give it room to land.
+	time.Sleep(200 * time.Millisecond)
+
+	mu.Lock()
+	callsA, callsB := calls[chA], calls[chB]
+	mu.Unlock()
+
+	assert.Equal(t, 1, callsA, "superseded socket must notify exactly once, not once per teardown path")
+	assert.Equal(t, 0, callsB, "replacement socket must never be reported as disconnected")
+
+	live, ok := s.GetChannel(cpID)
+	require.True(t, ok, "replacement socket must still be registered")
+	assert.Same(t, chB, live, "connection map must still hold the replacement")
+}

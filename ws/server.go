@@ -457,7 +457,10 @@ out:
 		log.Infof("client %s already connected, replacing stale connection", id)
 		delete(s.connections, id)
 		s.connMutex.Unlock()
-		_ = oldWs.connection.Close()
+		// Hard close, so the superseded socket's readPump fails at once instead of waiting
+		// out the read deadline. Goes through closeUnderlying because cleanup() nils
+		// w.connection under the write lock, and reading that field directly races it.
+		oldWs.closeUnderlying()
 		if s.disconnectedHandler != nil {
 			s.disconnectedHandler(oldWs)
 		}
@@ -504,21 +507,32 @@ func (s *server) handleDisconnect(w Channel, _ error) {
 	// s.connMutex.Lock()
 	// delete(s.connections, w.ID())
 	// s.connMutex.Unlock()
+	// ...
+	// if s.disconnectedHandler != nil {
+	// 	s.disconnectedHandler(w)
+	// }
 
-	// EVC OCPP PATCH: delete by identity, not by id.
-	// When a charge point reconnects, wsHandler replaces the map entry with the new socket
-	// while the old one is still tearing down on its own goroutine; a blind delete by id then
-	// removes the live replacement, leaving a charger that is connected but unreachable
-	// ("No socket with id X is open" on every write) until it gives up and reconnects — which
-	// starts the same race again.
+	// EVC OCPP PATCH: act on socket identity, not on id, for the map delete AND the callback.
+	// On a same-id reconnect wsHandler installs the new socket while the old one is still
+	// tearing down, so working by id lets this teardown evict the live replacement and, via
+	// disconnectedHandler, wipe its ocppj dispatcher queue and pending request state (both
+	// keyed by ID() alone). The charger then stays in the map reporting healthy while every
+	// send fails with "no client %s exists" until it reconnects again.
+	// Skipping a superseded socket loses no notification: whoever owns the id now fires its
+	// own disconnect later, and on the replace path wsHandler already called the handler
+	// inline for this one.
 	s.connMutex.Lock()
-	if existing, ok := s.connections[w.ID()]; ok && Channel(existing) == w {
+	current, ok := s.connections[w.ID()]
+	isCurrent := ok && Channel(current) == w
+	if isCurrent {
 		delete(s.connections, w.ID())
 	}
 	s.connMutex.Unlock()
 	log.Infof("closed connection to %s", w.ID())
-	// The callback still fires either way: this socket really did disconnect, and it is up to
-	// the handler to recognise a stale one.
+	if !isCurrent {
+		log.Debugf("skipping disconnect callback for superseded socket %s", w.ID())
+		return
+	}
 	if s.disconnectedHandler != nil {
 		s.disconnectedHandler(w)
 	}
